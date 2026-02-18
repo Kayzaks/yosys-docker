@@ -52,14 +52,17 @@ def build_abc_script(liberty_path, abc_settings):
     cmds = []
 
     # Load the tech library inside the script
-    cmds.append(f"read_liberty -u {liberty_path}")
+    cmds.append(f"read_liberty {liberty_path}")
 
     opt_cmd = abc_settings.get("optimizationCommand", "resyn2")
     optimize_for = abc_settings.get("optimizeFor", "balanced")
     custom = abc_settings.get("customScript", "")
 
-    # If user provided a meaningful custom script, use it
-    has_custom = custom and any(
+    # Only treat as custom if it's not the default placeholder
+    default_markers = ["# Custom ABC commands", "resyn2\nmap"]
+    is_default = any(marker in custom for marker in default_markers)
+
+    has_custom = custom and not is_default and any(
         line.strip() and not line.strip().startswith("#")
         for line in custom.strip().splitlines()
     )
@@ -75,9 +78,9 @@ def build_abc_script(liberty_path, abc_settings):
 
         # Technology mapping based on optimization target
         if optimize_for == "area":
-            cmds.append("strash; dch; amap")
+            cmds.append("amap")
         elif optimize_for == "delay":
-            cmds.append("strash; dch; map")
+            cmds.append("map")
         else:
             cmds.append("map")
 
