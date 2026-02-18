@@ -31,8 +31,8 @@ def transform_netlist(yosys_json):
     """Convert Yosys JSON output to [gates, wires] format."""
     gates = []
     wires = []
-    net_drivers = {}   # net_id -> gate_id that drives it
-    net_consumers = {} # net_id -> [(gate_id, port_name)]
+    net_drivers = {}
+    net_consumers = {}
 
     modules = yosys_json.get("modules", {})
     if not modules:
@@ -41,14 +41,13 @@ def transform_netlist(yosys_json):
     module_name = list(modules.keys())[0]
     module = modules[module_name]
 
-    # Process ports as INPUT/OUTPUT gates
     ports = module.get("ports", {})
     for port_name, port_info in ports.items():
         direction = port_info.get("direction", "input")
         bits = port_info.get("bits", [])
 
         for idx, bit in enumerate(bits):
-            if isinstance(bit, str):  # constant like "0" or "1"
+            if isinstance(bit, str):
                 continue
             suffix = f"_{idx}" if len(bits) > 1 else "_0"
             gate_id = f"port_{port_name}{suffix}"
@@ -75,11 +74,9 @@ def transform_netlist(yosys_json):
                     net_consumers[net_name] = []
                 net_consumers[net_name].append((gate_id, net_name))
 
-    # Process cells
     cells = module.get("cells", {})
     for cell_name, cell_info in cells.items():
         cell_type = cell_info.get("type", "UNKNOWN")
-        # Remove Yosys internal prefix characters
         if cell_type.startswith("$_"):
             cell_type = cell_type[2:]
         if cell_type.endswith("_"):
@@ -115,7 +112,6 @@ def transform_netlist(yosys_json):
             "properties": {"name": cell_name}
         })
 
-    # Build wires from net connections
     for net_name, driver_id in net_drivers.items():
         consumers = net_consumers.get(net_name, [])
         for consumer_id, consumer_port in consumers:
@@ -149,16 +145,19 @@ def synthesize():
         with open(verilog_file, "w") as f:
             f.write(verilog)
 
-        # Build Yosys script
         flatten = " -flatten" if yosys_settings.get("flatten") else ""
 
         if tech_library:
             lib_file = os.path.join(tmpdir, "tech.lib")
             generate_liberty(tech_library, lib_file)
+            has_ff = any(p['type'].upper().startswith('DFF') for p in tech_library)
             script = (
                 f"read_verilog {verilog_file}\n"
                 f"synth{flatten}\n"
-                f"dfflibmap -liberty {lib_file}\n"
+            )
+            if has_ff:
+                script += f"dfflibmap -liberty {lib_file}\n"
+            script += (
                 f"abc -liberty {lib_file}\n"
                 f"write_json {out_json}\n"
             )
@@ -172,7 +171,6 @@ def synthesize():
         with open(script_file, "w") as f:
             f.write(script)
 
-        # Run Yosys
         result = subprocess.run(
             ["yosys", "-s", script_file],
             capture_output=True, text=True
