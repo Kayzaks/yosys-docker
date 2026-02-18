@@ -8,43 +8,45 @@ import json
 app = Flask(__name__)
 CORS(app)
 
-
 def generate_liberty(primitives):
-    cells = ""
-    for p in primitives:
-        func = p.get("function", "")
-        num_inputs = p.get("numInputs", 2)
-        area = p.get("area", 1)
-        name = p.get("name", p.get("type", "GATE"))
-
-        pins = ""
-        for i in range(num_inputs):
-            pin_name = chr(65 + i)
-            pins += f"""
-        pin({pin_name}) {{
-            direction : input ;
-            capacitance : 1.0 ;
-        }}"""
-
-        pins += f"""
-        pin(Y) {{
-            direction : output ;
-            capacitance : 0.0 ;
-            function : "{func}" ;
-        }}"""
-
-        cells += f"""
-    cell({name}) {{
-        area : {area} ;{pins}
-    }}"""
-
-    return f"""library(tech) {{
-    delay_model : table_lookup ;
-    time_unit : "1ns" ;
-    capacitive_load_unit(1, pf) ;{cells}
-}}
-"""
-
+    """Generate a Liberty .lib file that ABC can actually parse."""
+    lines = []
+    lines.append("library(tech) {")
+    lines.append("  delay_model : table_lookup;")
+    lines.append("  time_unit : \"1ns\";")
+    lines.append("  capacity_unit : \"1pf\";")
+    lines.append("")
+    
+    for prim in primitives:
+        name = prim["name"]
+        func = prim.get("function", "")
+        area = prim.get("area", 1.0)
+        num_inputs = prim.get("numInputs", 1)
+        
+        lines.append(f"  cell({name}) {{")
+        lines.append(f"    area : {area};")
+        
+        # Input pins: A, B, C, ...
+        pin_names = [chr(65 + i) for i in range(num_inputs)]
+        for pin in pin_names:
+            lines.append(f"    pin({pin}) {{")
+            lines.append(f"      direction : input;")
+            lines.append(f"      capacitance : 0.01;")
+            lines.append(f"    }}")
+        
+        # Output pin Y with function
+        lines.append(f"    pin(Y) {{")
+        lines.append(f"      direction : output;")
+        lines.append(f"      capacitance : 0.01;")  
+        if func:
+            # ABC uses ' for NOT, * for AND, + for OR
+            lines.append(f"      function : \"{func}\";")
+        lines.append(f"    }}")
+        lines.append(f"  }}")
+        lines.append("")
+    
+    lines.append("}")
+    return "\n".join(lines)
 
 def parse_yosys_json(json_path):
     with open(json_path, "r") as f:
