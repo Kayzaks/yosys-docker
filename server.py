@@ -155,9 +155,9 @@ def synthesize():
 
             # Use architecture-specific synth if not generic
             if target_arch and target_arch != "generic":
-                script += f"synth_{target_arch}\n"
+                script += f"synth_{target_arch} -noabc\n"
             else:
-                script += f"{synth_cmd}\n"
+                script += f"{synth_cmd} -noabc\n"
 
             if flatten:
                 script += "flatten\n"
