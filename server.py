@@ -8,45 +8,44 @@ import json
 app = Flask(__name__)
 CORS(app)
 
+
 def generate_liberty(primitives):
     """Generate a Liberty .lib file that ABC can actually parse."""
     lines = []
     lines.append("library(tech) {")
     lines.append("  delay_model : table_lookup;")
-    lines.append("  time_unit : \"1ns\";")
-    lines.append("  capacity_unit : \"1pf\";")
+    lines.append('  time_unit : "1ns";')
+    lines.append('  capacity_unit : "1pf";')
     lines.append("")
-    
+
     for prim in primitives:
         name = prim["name"]
         func = prim.get("function", "")
         area = prim.get("area", 1.0)
         num_inputs = prim.get("numInputs", 1)
-        
+
         lines.append(f"  cell({name}) {{")
         lines.append(f"    area : {area};")
-        
-        # Input pins: A, B, C, ...
+
         pin_names = [chr(65 + i) for i in range(num_inputs)]
         for pin in pin_names:
             lines.append(f"    pin({pin}) {{")
             lines.append(f"      direction : input;")
             lines.append(f"      capacitance : 0.01;")
             lines.append(f"    }}")
-        
-        # Output pin Y with function
+
         lines.append(f"    pin(Y) {{")
         lines.append(f"      direction : output;")
-        lines.append(f"      capacitance : 0.01;")  
+        lines.append(f"      capacitance : 0.01;")
         if func:
-            # ABC uses ' for NOT, * for AND, + for OR
-            lines.append(f"      function : \"{func}\";")
+            lines.append(f'      function : "{func}";')
         lines.append(f"    }}")
         lines.append(f"  }}")
         lines.append("")
-    
+
     lines.append("}")
     return "\n".join(lines)
+
 
 def parse_yosys_json(json_path):
     with open(json_path, "r") as f:
@@ -56,7 +55,6 @@ def parse_yosys_json(json_path):
     wires = []
 
     for mod_name, mod in data.get("modules", {}).items():
-        # Collect port info for INPUT/OUTPUT nodes
         for port_name, port in mod.get("ports", {}).items():
             direction = port.get("direction", "")
             gate_type = "INPUT" if direction == "input" else "OUTPUT"
@@ -67,10 +65,13 @@ def parse_yosys_json(json_path):
                     "type": gate_type,
                     "inputs": [str(bit)] if gate_type == "OUTPUT" else [],
                     "outputs": [str(bit)] if gate_type == "INPUT" else [],
-                    "properties": {"name": f"{port_name}[{i}]" if len(port.get("bits", [])) > 1 else port_name}
+                    "properties": {
+                        "name": f"{port_name}[{i}]"
+                        if len(port.get("bits", [])) > 1
+                        else port_name
+                    },
                 })
 
-        # Collect cells
         for cell_name, cell in mod.get("cells", {}).items():
             cell_type = cell.get("type", "BUF").lstrip("$_").rstrip("_")
             connections = cell.get("connections", {})
@@ -90,13 +91,11 @@ def parse_yosys_json(json_path):
                 "type": cell_type,
                 "inputs": input_bits,
                 "outputs": output_bits,
-                "properties": {"original_type": cell.get("type", "")}
+                "properties": {"original_type": cell.get("type", "")},
             })
 
-        # Build wires from connections
-        # Map: bit -> list of (gate_id, port_direction)
-        bit_drivers = {}   # bit -> gate_id that drives it (output)
-        bit_consumers = {} # bit -> [gate_ids that consume it] (input)
+        bit_drivers = {}
+        bit_consumers = {}
 
         for g in gates:
             for bit in g.get("outputs", []):
@@ -112,10 +111,38 @@ def parse_yosys_json(json_path):
                     "from": driver,
                     "fromPort": f"out_{bit}",
                     "to": consumer,
-                    "toPort": f"in_{bit}"
+                    "toPort": f"in_{bit}",
                 })
 
     return gates, wires
+
+
+def build_abc_script(liberty_path, abc_settings):
+    """Build an ABC command string from abc_settings."""
+    custom_script = abc_settings.get("customScript", "").strip()
+    if custom_script:
+        # User provided a full custom ABC script — use it directly
+        return custom_script
+
+    opt_cmd = abc_settings.get("optimizationCommand", "")
+    optimize_for = abc_settings.get("optimizeFor", "balanced")
+
+    # Map optimizeFor to ABC flags
+    abc_cmds = []
+    if opt_cmd:
+        # Use the specified optimization command (e.g. "resyn2", "dc2", "compress2rs")
+        abc_cmds.append(opt_cmd)
+    else:
+        # Default optimization based on target
+        if optimize_for == "area":
+            abc_cmds.append("strash; dch; amap")
+        elif optimize_for == "speed":
+            abc_cmds.append("strash; dc2; map")
+        else:
+            # balanced
+            abc_cmds.append("strash; dc2; amap")
+
+    return "; ".join(abc_cmds)
 
 
 @app.route("/synthesize", methods=["POST"])
@@ -135,6 +162,7 @@ def synthesize():
             liberty_path = os.path.join(tmpdir, "tech.lib")
             json_path = os.path.join(tmpdir, "output.json")
             script_path = os.path.join(tmpdir, "synth.ys")
+            abc_script_path = os.path.join(tmpdir, "abc.script")
 
             with open(verilog_path, "w") as f:
                 f.write(verilog)
@@ -142,36 +170,62 @@ def synthesize():
             with open(liberty_path, "w") as f:
                 f.write(generate_liberty(tech_library))
 
-            # Determine if we have flip-flops in the library
             has_ff = any(
-                p.get("type", "").upper().startswith("DFF")
-                for p in tech_library
+                p.get("type", "").upper().startswith("DFF") for p in tech_library
             )
 
-            # Build Yosys synthesis script
+            # --- Yosys settings ---
             flatten = yosys_settings.get("flatten", False)
             synth_cmd = yosys_settings.get("synthCommand", "synth")
             target_arch = yosys_settings.get("targetArch", "generic")
+            opt_level = yosys_settings.get("optimizationLevel", "default")
+            custom_script = yosys_settings.get("customScript", "").strip()
 
-            script = f"read_verilog {verilog_path}\n"
-
-            # Use architecture-specific synth if not generic
-            if target_arch and target_arch != "generic":
-                script += f"synth_{target_arch} -noabc\n"
+            if custom_script:
+                # User provided a full custom Yosys script — use it,
+                # but ensure read_verilog and write_json are present
+                script = ""
+                if "read_verilog" not in custom_script:
+                    script += f"read_verilog {verilog_path}\n"
+                script += custom_script + "\n"
+                if "write_json" not in custom_script:
+                    script += f"write_json {json_path}\n"
             else:
-                script += f"{synth_cmd} -noabc\n"
+                # Build script from settings
+                script = f"read_verilog {verilog_path}\n"
 
-            if flatten:
-                script += "flatten\n"
+                # Synth command with architecture and optimization level
+                if target_arch and target_arch != "generic":
+                    synth_line = f"synth_{target_arch} -noabc"
+                else:
+                    synth_line = f"{synth_cmd} -noabc"
 
-            script += "opt\n"
+                # Append optimization level if not default
+                if opt_level and opt_level != "default":
+                    # Yosys synth supports -O0, -O1, -O2, -O3
+                    level_map = {"none": "0", "low": "1", "medium": "2", "high": "3"}
+                    level_num = level_map.get(opt_level, "")
+                    if level_num:
+                        synth_line += f" -O{level_num}"
 
-            if has_ff:
-                script += f"dfflibmap -liberty {liberty_path}\n"
+                script += synth_line + "\n"
 
-            script += f"abc -liberty {liberty_path}\n"
-            script += "opt_clean -purge\n"
-            script += f"write_json {json_path}\n"
+                if flatten:
+                    script += "flatten\n"
+
+                script += "opt\n"
+
+                if has_ff:
+                    script += f"dfflibmap -liberty {liberty_path}\n"
+
+                # --- ABC settings ---
+                abc_cmds = build_abc_script(liberty_path, abc_settings)
+                with open(abc_script_path, "w") as f:
+                    f.write(abc_cmds)
+
+                script += f"abc -liberty {liberty_path} -script {abc_script_path}\n"
+                script += "opt_clean -purge\n"
+                script += f"write_json {json_path}\n"
 
             with open(script_path, "w") as f:
                 f.write(script)
@@ -180,18 +234,17 @@ def synthesize():
                 ["yosys", "-s", script_path],
                 capture_output=True,
                 text=True,
-                timeout=120
+                timeout=120,
             )
 
             if not os.path.exists(json_path):
                 return jsonify({
                     "error": "Yosys synthesis failed",
                     "stderr": result.stderr[-2000:] if result.stderr else "",
-                    "stdout": result.stdout[-2000:] if result.stdout else ""
+                    "stdout": result.stdout[-2000:] if result.stdout else "",
                 }), 400
 
             gates, wires = parse_yosys_json(json_path)
-
             return jsonify([gates, wires])
 
     except subprocess.TimeoutExpired:
