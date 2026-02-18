@@ -14,12 +14,21 @@ def generate_liberty(tech_library, path):
     lines = ['library(tech) {']
 
     # Always include an inverter so ABC can map
-    has_inv = any(p.get('function') and "'" in p['function'] and p.get('numInputs', 0) == 1 for p in tech_library)
+    has_inv = any(
+        p.get('function') and p.get('numInputs', 0) == 1
+        and "'" in p.get('function', '')
+        for p in tech_library
+    )
     if not has_inv:
         lines.append('  cell(_auto_inv_) {')
-        lines.append('    area: 0.5;')
-        lines.append("    pin(A) { direction: input; }")
-        lines.append("    pin(Y) { direction: output; function: \"A'\"; }")
+        lines.append('    area : 0.5;')
+        lines.append('    pin(A) {')
+        lines.append('      direction : input;')
+        lines.append('    }')
+        lines.append('    pin(Y) {')
+        lines.append('      direction : output;')
+        lines.append('      function : "A\'";')
+        lines.append('    }')
         lines.append('  }')
 
     for prim in tech_library:
@@ -29,22 +38,25 @@ def generate_liberty(tech_library, path):
         func = prim.get('function', '')
 
         lines.append(f'  cell({name}) {{')
-        lines.append(f'    area: {area};')
+        lines.append(f'    area : {area};')
 
-        # Generate pin names: A, B, C, D...
         pin_names = [chr(ord('A') + i) for i in range(num_inputs)]
         for pin in pin_names:
-            lines.append(f'    pin({pin}) {{ direction: input; }}')
+            lines.append(f'    pin({pin}) {{')
+            lines.append(f'      direction : input;')
+            lines.append(f'    }}')
 
+        lines.append(f'    pin(Y) {{')
+        lines.append(f'      direction : output;')
         if func:
-            lines.append(f'    pin(Y) {{ direction: output; function: "{func}"; }}')
-        else:
-            lines.append(f'    pin(Y) {{ direction: output; }}')
+            lines.append(f'      function : "{func}";')
+        lines.append(f'    }}')
 
         lines.append('  }')
     lines.append('}')
     with open(path, 'w') as f:
         f.write('\n'.join(lines))
+
 
 
 def transform_netlist(yosys_json):
