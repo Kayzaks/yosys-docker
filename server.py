@@ -1,260 +1,179 @@
-import os
-import json
-import tempfile
-import subprocess
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import tempfile
+import os
+import subprocess
+import json
 
 app = Flask(__name__)
 CORS(app)
 
-YOSYS_BIN = os.environ.get("YOSYS_BIN", "yosys")
-
 
 def generate_liberty(primitives):
-    """Generate a minimal Liberty file from the tech library primitives."""
-    cells = []
+    """
+    Generate a simple combinational Liberty that ABC can parse.
+
+    Notes:
+    - ABC/Yosys are picky: keep this minimal.
+    - For combinational cells, put boolean 'function' on the OUTPUT pin.
+    - Use simple input pin naming A,B,C...
+    """
+    lines = []
+    lines.append("library(tech) {")
+    lines.append('  delay_model : table_lookup;')
+    lines.append('  time_unit : "1ns";')
+    lines.append('  voltage_unit : "1V";')
+    lines.append('  current_unit : "1mA";')
+    lines.append('  pulling_resistance_unit : "1kohm";')
+    lines.append('  capacitive_load_unit(1,pf);')
+    lines.append("")
+
     for prim in primitives:
-        name = prim.get("name", "UNKNOWN")
-        area = prim.get("area", 1)
-        num_inputs = prim.get("numInputs", 2)
+        name = prim["name"]
         func = prim.get("function", "")
+        area = prim.get("area", 1.0)
+        num_inputs = int(prim.get("numInputs", 1))
 
-        input_names = [chr(65 + i) for i in range(num_inputs)]  # A, B, C, ...
-        output_name = "Y"
+        lines.append(f"  cell({name}) {{")
+        lines.append(f"    area : {area};")
 
-        pin_blocks = []
-        for pin in input_names:
-            pin_blocks.append(f"""
-        pin({pin}) {{
-            direction : input;
-        }}""")
+        pin_names = [chr(65 + i) for i in range(num_inputs)]
+        for pin in pin_names:
+            lines.append(f"    pin({pin}) {{")
+            lines.append("      direction : input;")
+            lines.append("      capacitance : 0.01;")
+            lines.append("    }")
 
-        func_attr = f'\n            function : "{func}";' if func else ""
-        pin_blocks.append(f"""
-        pin({output_name}) {{
-            direction : output;{func_attr}
-        }}""")
+        lines.append("    pin(Y) {")
+        lines.append("      direction : output;")
+        # Output capacitance is not really correct, but harmless for pure Boolean mapping.
+        lines.append("      capacitance : 0.01;")
+        if func:
+            # Ensure it is quoted
+            lines.append(f'      function : "{func}";')
+        lines.append("    }")
+        lines.append("  }")
+        lines.append("")
 
-        cells.append(f"""
-    cell({name}) {{
-        area : {area};{"".join(pin_blocks)}
-    }}""")
-
-    return f"""library(tech) {{{"".join(cells)}
-}}
-"""
+    lines.append("}")
+    return "\n".join(lines)
 
 
-def build_opt_script(abc_settings):
-    """Build an ABC optimization-only script (no mapping)."""
+def build_abc_script(abc_settings):
+    """
+    Build ABC commands for optimization/mapping.
+
+    IMPORTANT:
+    - Do NOT 'read_liberty' here. Let Yosys provide the liberty via:
+        abc -liberty tech.lib -script abc.script
+      That keeps Yosys' ABC integration consistent and avoids a bunch of edge cases.
+    """
+    opt_cmd = abc_settings.get("optimizationCommand", "resyn2")
+    optimize_for = abc_settings.get("optimizeFor", "balanced")
+    custom = abc_settings.get("customScript", "")
+
+    # Treat as "default" placeholder if it matches common template fragments
+    default_markers = ["# Custom ABC commands", "resyn2", "map"]
+    is_default = any(m in custom for m in default_markers)
+
+    has_custom = bool(custom and not is_default and any(
+        line.strip() and not line.strip().startswith("#")
+        for line in custom.strip().splitlines()
+    ))
+
     cmds = []
 
-    custom = abc_settings.get("customScript", "")
-    # Detect default placeholder
-    is_default = not custom or any(
-        marker in custom
-        for marker in ["# Custom ABC commands", "resyn2\nmap"]
-    )
-    has_custom = (
-        custom
-        and not is_default
-        and any(
-            line.strip() and not line.strip().startswith("#")
-            for line in custom.splitlines()
-        )
-    )
-
     if has_custom:
-        for line in custom.splitlines():
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                # Skip any mapping commands — we handle mapping in step 2
-                if stripped in ("map", "amap", "dch", "if"):
-                    continue
-                # Skip read_liberty/read_lib — handled by Yosys in step 2
-                if stripped.startswith("read_lib"):
-                    continue
-                cmds.append(stripped)
+        for line in custom.strip().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                cmds.append(line)
+        # If user forgot to call map, do it (mapping must happen).
+        if not any(line.split()[0] in ("map", "amap") for line in cmds if line):
+            cmds.append("map")
     else:
-        opt_cmd = abc_settings.get("optimizationCommand", "resyn2")
-        optimize_for = abc_settings.get("optimizeFor", "balanced")
+        # A safe, common baseline for AIG rewriting
+        # (You can tune this, but keep it simple while debugging.)
+        cmds.append("strash")
+        cmds.append(opt_cmd)
 
-        if optimize_for == "area":
-            cmds.append(opt_cmd)
-            cmds.append("resyn2")
-        elif optimize_for == "delay":
-            cmds.append(opt_cmd)
-            cmds.append("resyn3")
-        else:
-            cmds.append(opt_cmd)
+        # For liberty cell mapping, 'map' is usually the right default.
+        # 'amap' can be more fragile depending on network/library details.
+        cmds.append("map")
 
-    return "\n".join(cmds) if cmds else "resyn2"
+        # If you *really* want to try area/delay variants later, do it here,
+        # but keep 'map' for stability.
 
-
-def build_yosys_script(
-    verilog_path, json_output_path, yosys_settings, liberty_path, abc_opt_script_path
-):
-    """Build the Yosys synthesis script."""
-    synth_cmd = yosys_settings.get("synthCommand", "synth -noabc")
-    opt_level = yosys_settings.get("optimizationLevel", "medium")
-    flatten = yosys_settings.get("flatten", False)
-    custom_script = yosys_settings.get("customScript", "")
-
-    # Map optimization level to Yosys -O flag
-    opt_map = {"none": "-O0", "low": "-O1", "medium": "-O2", "high": "-O3"}
-    opt_flag = opt_map.get(opt_level, "-O2")
-
-    # Ensure -noabc is present in synth command
-    if "synth" in synth_cmd and "-noabc" not in synth_cmd:
-        synth_cmd += " -noabc"
-
-    # Check if custom script is just the default placeholder
-    is_default_custom = not custom_script or any(
-        marker in custom_script
-        for marker in ["# Custom Yosys commands", "synth -noabc\nopt\ntechmap\nopt"]
-    )
-
-    script = f"read_verilog {verilog_path}\n"
-
-    if not is_default_custom and custom_script.strip():
-        # Use custom script but ensure essential commands
-        lines = custom_script.strip().splitlines()
-        for line in lines:
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                if stripped.startswith("read_verilog"):
-                    continue  # Already added
-                if stripped.startswith("write_json"):
-                    continue  # Added at end
-                script += f"{stripped}\n"
-    else:
-        # Standard synthesis flow
-        if flatten:
-            script += "flatten\n"
-
-        script += f"{synth_cmd} {opt_flag}\n"
-        script += "opt\n"
-        script += "techmap\n"
-        script += "opt\n"
-
-    # Step 1: ABC optimization only (no mapping)
-    script += f'abc -script {abc_opt_script_path}\n'
-
-    # Step 2: ABC technology mapping with Liberty
-    script += f'abc -liberty {liberty_path}\n'
-
-    # Clean up and output
-    script += "opt_clean -purge\n"
-    script += f"write_json {json_output_path}\n"
-
-    return script
+    return "\n".join(cmds) + "\n"
 
 
 def parse_yosys_json(json_path):
-    """Parse the Yosys JSON output into gates and wires."""
     with open(json_path, "r") as f:
         data = json.load(f)
 
     gates = []
     wires = []
 
-    modules = data.get("modules", {})
-    if not modules:
-        return gates, wires
-
-    # Take the first module
-    module_name = list(modules.keys())[0]
-    module = modules[module_name]
-
-    ports = module.get("ports", {})
-    cells = module.get("cells", {})
-    netnames = module.get("netnames", {})
-
-    # Build a map from bit number to net name
-    bit_to_net = {}
-    for net_name, net_info in netnames.items():
-        for idx, bit in enumerate(net_info.get("bits", [])):
-            if isinstance(bit, int):
-                suffix = f"[{idx}]" if len(net_info.get("bits", [])) > 1 else ""
-                bit_to_net[bit] = f"{net_name}{suffix}"
-
-    # Create INPUT/OUTPUT gates from ports
-    for port_name, port_info in ports.items():
-        direction = port_info.get("direction", "")
-        bits = port_info.get("bits", [])
-
-        for idx, bit in enumerate(bits):
-            if not isinstance(bit, int):
-                continue
-            suffix = f"[{idx}]" if len(bits) > 1 else ""
-            gate_id = f"{port_name}{suffix}"
-
-            if direction == "input":
-                gates.append(
-                    {
-                        "id": gate_id,
-                        "type": "INPUT",
-                        "inputs": [],
-                        "outputs": [str(bit)],
+    for mod_name, mod in data.get("modules", {}).items():
+        # Ports -> pseudo IO gates
+        for port_name, port in mod.get("ports", {}).items():
+            direction = port.get("direction", "")
+            gate_type = "INPUT" if direction == "input" else "OUTPUT"
+            for i, bit in enumerate(port.get("bits", [])):
+                gate_id = f"{gate_type}_{port_name}_{i}"
+                gates.append({
+                    "id": gate_id,
+                    "type": gate_type,
+                    "inputs": [str(bit)] if gate_type == "OUTPUT" else [],
+                    "outputs": [str(bit)] if gate_type == "INPUT" else [],
+                    "properties": {
+                        "name": f"{port_name}[{i}]" if len(port.get("bits", [])) > 1 else port_name
                     }
-                )
-            elif direction == "output":
-                gates.append(
-                    {
-                        "id": gate_id,
-                        "type": "OUTPUT",
-                        "inputs": [str(bit)],
-                        "outputs": [],
-                    }
-                )
+                })
 
-    # Create gates from cells
-    for cell_name, cell_info in cells.items():
-        cell_type = cell_info.get("type", "UNKNOWN").lstrip("\\")
-        connections = cell_info.get("connections", {})
-        port_directions = cell_info.get("port_directions", {})
+        # Cells
+        for cell_name, cell in mod.get("cells", {}).items():
+            cell_type = cell.get("type", "BUF").lstrip("$_").rstrip("_")
+            connections = cell.get("connections", {})
 
-        input_bits = []
-        output_bits = []
+            input_bits = []
+            output_bits = []
+            port_dirs = cell.get("port_directions", {})
 
-        for conn_name, bits in connections.items():
-            direction = port_directions.get(conn_name, "input")
-            for bit in bits:
-                if isinstance(bit, int):
-                    if direction == "output":
-                        output_bits.append(str(bit))
-                    else:
+            for pin_name, bits in connections.items():
+                pin_dir = port_dirs.get(pin_name, "input")
+                for bit in bits:
+                    if pin_dir == "input":
                         input_bits.append(str(bit))
+                    else:
+                        output_bits.append(str(bit))
 
-        gates.append(
-            {
+            gates.append({
                 "id": cell_name,
                 "type": cell_type,
                 "inputs": input_bits,
                 "outputs": output_bits,
-            }
-        )
+                "properties": {"original_type": cell.get("type", "")}
+            })
 
-    # Build wires from gate connections
-    # Create a map: bit -> producing gate
-    bit_producers = {}
-    for gate in gates:
-        for bit in gate.get("outputs", []):
-            bit_producers[bit] = gate["id"]
+        # Wires: driver->consumer per bit
+        bit_drivers = {}
+        bit_consumers = {}
 
-    for gate in gates:
-        for port_idx, bit in enumerate(gate.get("inputs", [])):
-            producer = bit_producers.get(bit)
-            if producer and producer != gate["id"]:
-                wires.append(
-                    {
-                        "from": producer,
-                        "fromPort": f"out_{bit}",
-                        "to": gate["id"],
-                        "toPort": f"in_{port_idx}",
-                    }
-                )
+        for g in gates:
+            for bit in g.get("outputs", []):
+                bit_drivers[bit] = g["id"]
+            for bit in g.get("inputs", []):
+                bit_consumers.setdefault(bit, []).append(g["id"])
+
+        for bit, driver in bit_drivers.items():
+            for consumer in bit_consumers.get(bit, []):
+                wires.append({
+                    "from": driver,
+                    "fromPort": f"out_{bit}",
+                    "to": consumer,
+                    "toPort": f"in_{bit}",
+                })
 
     return gates, wires
 
@@ -262,142 +181,170 @@ def parse_yosys_json(json_path):
 @app.route("/synthesize", methods=["POST"])
 def synthesize():
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON body provided"}), 400
-
+        data = request.get_json() or {}
         verilog = data.get("verilog", "")
-        yosys_settings = data.get("yosys_settings", {})
-        abc_settings = data.get("abc_settings", {})
-        tech_library = data.get("tech_library", [])
+        yosys_settings = data.get("yosys_settings", {}) or {}
+        abc_settings = data.get("abc_settings", {}) or {}
+        tech_library = data.get("tech_library", []) or []
 
         if not verilog.strip():
-            return jsonify({"error": "No Verilog source provided"}), 400
+            return jsonify({"error": "No Verilog code provided"}), 400
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Write Verilog source
             verilog_path = os.path.join(tmpdir, "input.v")
+            liberty_path = os.path.join(tmpdir, "tech.lib")
+            json_path = os.path.join(tmpdir, "output.json")
+            script_path = os.path.join(tmpdir, "synth.ys")
+            abc_script_path = os.path.join(tmpdir, "abc.script")
+
             with open(verilog_path, "w") as f:
                 f.write(verilog)
 
-            # Generate Liberty file from tech library
-            liberty_path = os.path.join(tmpdir, "tech.lib")
-            liberty_content = generate_liberty(tech_library)
             with open(liberty_path, "w") as f:
-                f.write(liberty_content)
+                f.write(generate_liberty(tech_library))
 
-            # Build ABC optimization script (no mapping commands)
-            abc_opt_script_path = os.path.join(tmpdir, "abc_opt.script")
-            abc_opt_script = build_opt_script(abc_settings)
-            with open(abc_opt_script_path, "w") as f:
-                f.write(abc_opt_script)
+            # ABC script: optimization + map, but NO read_liberty
+            abc_script = build_abc_script(abc_settings)
+            with open(abc_script_path, "w") as f:
+                f.write(abc_script)
 
-            # Build Yosys script
-            json_output_path = os.path.join(tmpdir, "output.json")
-            yosys_script = build_yosys_script(
-                verilog_path,
-                json_output_path,
-                yosys_settings,
-                liberty_path,
-                abc_opt_script_path,
+            # Flip-flop library presence
+            has_ff = any(
+                str(p.get("type", "")).upper().startswith("DFF")
+                for p in tech_library
             )
 
-            script_path = os.path.join(tmpdir, "synth.ys")
-            with open(script_path, "w") as f:
-                f.write(yosys_script)
+            # Optimization level -> -O flag (for synth)
+            opt_level = yosys_settings.get("optimizationLevel", "medium")
+            level_map = {"none": "0", "low": "1", "medium": "2", "high": "3"}
+            opt_flag = f"-O{level_map.get(opt_level, '2')}"
 
-            # Run Yosys
+            flatten = bool(yosys_settings.get("flatten", False))
+            custom_yosys = yosys_settings.get("customScript", "")
+
+            # If custom Yosys is provided, we still enforce the critical ordering around abc.
+            has_custom_yosys = bool(custom_yosys and any(
+                line.strip() and not line.strip().startswith("#")
+                for line in custom_yosys.strip().splitlines()
+            ))
+
+            if has_custom_yosys:
+                script_lines = []
+                custom_lines = custom_yosys.strip()
+
+                # Ensure we read the design
+                if "read_verilog" not in custom_lines:
+                    script_lines.append(f"read_verilog {verilog_path}")
+                script_lines.append(custom_lines)
+
+                # Ensure design is in a good state before ABC
+                # (These are usually safe even if already done.)
+                script_lines += [
+                    "proc; opt",
+                    "memory; opt",
+                    "techmap; opt",
+                ]
+
+                if flatten:
+                    script_lines.append("flatten")
+
+                if has_ff:
+                    script_lines.append(f"dfflibmap -liberty {liberty_path}")
+
+                # Critical: use -liberty here (do not rely on read_liberty in abc script)
+                # Optional debugging flags (enable if needed):
+                #   -showtmp -nocleanup
+                script_lines.append(
+                    f"abc -liberty {liberty_path} -script {abc_script_path}"
+                )
+
+                script_lines.append("opt_clean -purge")
+
+                if "write_json" not in custom_lines:
+                    script_lines.append(f"write_json {json_path}")
+
+                script = "\n".join(script_lines) + "\n"
+
+            else:
+                # Standard synthesis flow, but we control ordering.
+                synth_cmd = yosys_settings.get("synthCommand", "synth")
+
+                script_lines = [
+                    f"read_verilog {verilog_path}",
+                ]
+
+                # Run synth without abc (we will call abc ourselves with -liberty)
+                cmd = synth_cmd
+                if "-noabc" not in cmd:
+                    cmd += " -noabc"
+                # Add opt flag if user didn't already
+                if "-O" not in cmd:
+                    cmd += f" {opt_flag}"
+                script_lines.append(cmd)
+
+                if flatten:
+                    script_lines.append("flatten")
+
+                # Additional cleanup/normalization before mapping
+                script_lines += [
+                    "proc; opt",
+                    "memory; opt",
+                    "techmap; opt",
+                    "opt",
+                ]
+
+                if has_ff:
+                    script_lines.append(f"dfflibmap -liberty {liberty_path}")
+
+                # Critical: use -liberty
+                script_lines.append(
+                    f"abc -liberty {liberty_path} -script {abc_script_path}"
+                )
+
+                script_lines += [
+                    "opt_clean -purge",
+                    f"write_json {json_path}",
+                ]
+
+                script = "\n".join(script_lines) + "\n"
+
+            with open(script_path, "w") as f:
+                f.write(script)
+
+            # Even if your FS is fine, forcing temp files into tmpdir
+            # makes ABC temp behavior more deterministic.
+            env = os.environ.copy()
+            env["TMPDIR"] = tmpdir
+            env["TMP"] = tmpdir
+            env["TEMP"] = tmpdir
+
             result = subprocess.run(
-                [YOSYS_BIN, "-s", script_path],
+                ["yosys", "-s", script_path],
                 capture_output=True,
                 text=True,
                 timeout=120,
+                env=env,
             )
 
-            if result.returncode != 0:
-                return (
-                    jsonify(
-                        {
-                            "error": "Yosys synthesis failed",
-                            "stderr": result.stderr[-2000:] if result.stderr else "",
-                            "stdout": result.stdout[-2000:] if result.stdout else "",
-                        }
-                    ),
-                    400,
-                )
+            if not os.path.exists(json_path):
+                return jsonify({
+                    "error": "Yosys synthesis failed",
+                    "stderr": (result.stderr or "")[-4000:],
+                    "stdout": (result.stdout or "")[-4000:],
+                    "yosys_script": script,  # helpful when debugging
+                    "abc_script": abc_script,
+                }), 400
 
-            # Check output exists
-            if not os.path.exists(json_output_path):
-                return (
-                    jsonify(
-                        {
-                            "error": "Yosys produced no output",
-                            "stderr": result.stderr[-2000:] if result.stderr else "",
-                            "stdout": result.stdout[-2000:] if result.stdout else "",
-                        }
-                    ),
-                    400,
-                )
-
-            # Parse output
-            gates, wires = parse_yosys_json(json_output_path)
-
-            # Compute stats
-            gate_breakdown = {}
-            max_fanout = 0
-            for g in gates:
-                gtype = g["type"]
-                gate_breakdown[gtype] = gate_breakdown.get(gtype, 0) + 1
-                fanout = sum(
-                    1
-                    for w in wires
-                    if w["from"] == g["id"]
-                )
-                max_fanout = max(max_fanout, fanout)
-
-            # Compute max depth via BFS
-            adjacency = {}
-            in_degree = {}
-            for g in gates:
-                adjacency.setdefault(g["id"], [])
-                in_degree.setdefault(g["id"], 0)
-            for w in wires:
-                adjacency.setdefault(w["from"], []).append(w["to"])
-                in_degree.setdefault(w["to"], 0)
-                in_degree[w["to"]] = in_degree.get(w["to"], 0) + 1
-
-            # Topological sort for depth
-            depth = {gid: 0 for gid in adjacency}
-            queue = [gid for gid, deg in in_degree.items() if deg == 0]
-            max_depth = 0
-            while queue:
-                nxt = []
-                for gid in queue:
-                    for neighbor in adjacency.get(gid, []):
-                        depth[neighbor] = max(depth[neighbor], depth[gid] + 1)
-                        max_depth = max(max_depth, depth[neighbor])
-                        in_degree[neighbor] -= 1
-                        if in_degree[neighbor] == 0:
-                            nxt.append(neighbor)
-                queue = nxt
-
-            stats = {
-                "totalGates": len(gates),
-                "gateBreakdown": gate_breakdown,
-                "maxDepth": max_depth,
-                "maxFanout": max_fanout,
-                "wireCount": len(wires),
-            }
-
-            return jsonify({"gates": gates, "wires": wires, "stats": stats})
+            gates, wires = parse_yosys_json(json_path)
+            return jsonify([gates, wires])
 
     except subprocess.TimeoutExpired:
         return jsonify({"error": "Synthesis timed out (120s limit)"}), 504
     except Exception as e:
-        return jsonify({"error": f"Internal error: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
 
 
-@app.route("/health", methods=["GET", "HEAD"])
+@app.route("/", methods=["GET", "HEAD"])
 def health():
     return jsonify({"status": "ok"})
 
