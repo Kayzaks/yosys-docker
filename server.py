@@ -150,7 +150,6 @@ def synthesize():
             )
 
             # Build Yosys synthesis script
-            flatten = yosys_settings.get("flatten", False)
             synth_cmd = yosys_settings.get("synthCommand", "synth")
             target_arch = yosys_settings.get("targetArch", "generic")
 
@@ -162,16 +161,16 @@ def synthesize():
             else:
                 script += f"{synth_cmd} -noabc\n"
 
-            if flatten:
-                script += "flatten\n"
-
-            script += "opt\n"
+            script += "flatten\n"
+            script += "opt -full\n"
+            script += "opt_share\n"
+            script += "opt_demorgan\n"
+            script += "opt -full\n"
 
             if has_ff:
                 script += f"dfflibmap -liberty {liberty_path}\n"
 
-            ABC_DELAY_PS = 1_000_000  # 1 microsecond
-            script += f"abc -liberty {liberty_path} -D {ABC_DELAY_PS}\n"
+            script += f"abc -liberty {liberty_path}\n"
             script += "opt_clean -purge\n"
             script += f"write_json {json_path}\n"
 
