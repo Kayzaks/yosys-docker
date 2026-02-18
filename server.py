@@ -12,50 +12,48 @@ def health():
 @app.route("/synthesize", methods=["POST"])
 def synthesize():
     data = request.json
-    verilog = data["verilog"]
+    verilog = data.get("verilog", "")
     yosys_settings = data.get("yosys_settings", {})
 
-    with tempfile.TemporaryDirectory() as tmp:
-        src = os.path.join(tmp, "input.v")
-        out_json = os.path.join(tmp, "out.json")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        verilog_file = os.path.join(tmpdir, "input.v")
+        out_json = os.path.join(tmpdir, "out.json")
+        script_file = os.path.join(tmpdir, "synth.ys")
 
-        with open(src, "w") as f:
+        with open(verilog_file, "w") as f:
             f.write(verilog)
 
-        # Build Yosys script from settings
-        opt = yosys_settings.get("optimizationLevel", "medium")
-        flatten = yosys_settings.get("flatten", True)
-        custom = yosys_settings.get("customScript", "").strip()
+        # Build Yosys script
+        flatten = " -flatten" if yosys_settings.get("flatten") else ""
+        script = f"read_verilog {verilog_file}\nsynth{flatten}\nwrite_json {out_json}\n"
 
-        if custom:
-            script = custom.replace("{input}", src).replace("{output}", out_json)
-        else:
-            steps = [f"read_verilog {src}"]
-            synth_cmd = yosys_settings.get("synthCommand", "synth")
-            if flatten:
-                synth_cmd += " -flatten"
-            steps.append(synth_cmd)
-            if opt in ("medium", "high"):
-                steps.append("opt -full")
-            if opt == "high":
-                steps.append("opt -full; clean -purge")
-            steps.append(f"write_json {out_json}")
-            script = "; ".join(steps)
+        with open(script_file, "w") as f:
+            f.write(script)
 
+        # Run Yosys and CHECK the result
         result = subprocess.run(
-            ["yosys", "-p", script],
-            capture_output=True, text=True, timeout=60
+            ["yosys", "-s", script_file],
+            capture_output=True, text=True
         )
+
         if result.returncode != 0:
-            return jsonify({"error": result.stderr[-2000:]}), 400
+            return jsonify({
+                "error": "Yosys synthesis failed",
+                "stderr": result.stderr[-2000:],  # last 2000 chars
+                "stdout": result.stdout[-2000:]
+            }), 400
+
+        if not os.path.exists(out_json):
+            return jsonify({
+                "error": "Yosys did not produce output",
+                "stderr": result.stderr[-2000:]
+            }), 400
 
         with open(out_json) as f:
-            raw = json.load(f)
+            yosys_json = json.load(f)
 
-        gates, wires = transform_netlist(raw)
-        stats = compute_stats(gates, wires)
-
-    return jsonify({"gates": gates, "wires": wires, "stats": stats})
+        netlist = transform_netlist(yosys_json)
+        return jsonify(netlist)
 
 
 def transform_netlist(yosys_json):
