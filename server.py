@@ -170,7 +170,8 @@ def synthesize():
             if has_ff:
                 script += f"dfflibmap -liberty {liberty_path}\n"
 
-            script += f"abc -liberty {liberty_path}\n"
+            ABC_DELAY_PS = 1_000_000  # 1 microsecond
+            script += f"abc -liberty {liberty_path} -D {ABC_DELAY_PS}\n"
             script += "opt_clean -purge\n"
             script += f"write_json {json_path}\n"
 
