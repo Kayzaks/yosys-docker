@@ -12,15 +12,35 @@ CORS(app)
 def generate_liberty(tech_library, path):
     """Generate a minimal Liberty .lib file from the user's tech library."""
     lines = ['library(tech) {']
+
+    # Always include an inverter so ABC can map
+    has_inv = any(p.get('function') and "'" in p['function'] and p.get('numInputs', 0) == 1 for p in tech_library)
+    if not has_inv:
+        lines.append('  cell(_auto_inv_) {')
+        lines.append('    area: 0.5;')
+        lines.append("    pin(A) { direction: input; }")
+        lines.append("    pin(Y) { direction: output; function: \"A'\"; }")
+        lines.append('  }')
+
     for prim in tech_library:
         name = prim['name']
         area = prim.get('area', 1.0)
         num_inputs = prim.get('numInputs', 2)
+        func = prim.get('function', '')
+
         lines.append(f'  cell({name}) {{')
         lines.append(f'    area: {area};')
-        for i in range(num_inputs):
-            lines.append(f'    pin(I{i}) {{ direction: input; }}')
-        lines.append(f'    pin(Y) {{ direction: output; }}')
+
+        # Generate pin names: A, B, C, D...
+        pin_names = [chr(ord('A') + i) for i in range(num_inputs)]
+        for pin in pin_names:
+            lines.append(f'    pin({pin}) {{ direction: input; }}')
+
+        if func:
+            lines.append(f'    pin(Y) {{ direction: output; function: "{func}"; }}')
+        else:
+            lines.append(f'    pin(Y) {{ direction: output; }}')
+
         lines.append('  }')
     lines.append('}')
     with open(path, 'w') as f:
